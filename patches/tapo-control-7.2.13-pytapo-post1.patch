@@ -10,3 +10,14 @@ diff --git a/custom_components/tapo_control/const.py b/custom_components/tapo_co
  DOMAIN = "tapo_control"
  DOMAIN_CONFIG = DOMAIN + "_config"
  BRAND = "TP-Link"
+diff --git a/custom_components/tapo_control/camera.py b/custom_components/tapo_control/camera.py
+--- a/custom_components/tapo_control/camera.py
++++ b/custom_components/tapo_control/camera.py
+@@ -1010,6 +1010,6 @@
+     async def stream_source(self) -> str | None:
+         if self._stream_fd is None:
+-            raise HomeAssistantError("Tapo direct stream pipe is not available")
++            return None
+         source = f"pipe:{self._stream_fd}"
+         LOGGER.debug("stream_source: returning %s", source)
+         return source
