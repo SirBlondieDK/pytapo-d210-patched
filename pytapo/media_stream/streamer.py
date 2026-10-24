@@ -9,6 +9,39 @@ HLS_LIST_SIZE = 3
 HLS_FLAGS = "delete_segments+append_list"
 
 
+class StreamerCleanupError(RuntimeError):
+    """Raised when a streamer cannot prove that all resources were released."""
+
+
+async def _await_bounded(awaitable, timeout):
+    """Await with a timeout without asyncio.wait_for's old cancel race.
+
+    Python 3.9/3.10 asyncio.wait_for() can swallow an external cancellation
+    when the inner task completes at the same instant.  This explicit race
+    keeps timeout and caller cancellation distinct and always settles the
+    inner task before returning control to lifecycle cleanup.
+    """
+    task = asyncio.create_task(awaitable)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+        raise
+    if task not in done:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise TimeoutError(f"operation exceeded {timeout:.3f}s")
+    return task.result()
+
+
 class Streamer:
     """
     In case of multiple streams (different lens) available on device, device sends them all in separate video streams.
@@ -41,6 +74,12 @@ class Streamer:
         audio=None,
         ignore_limit=None,
         no_data_timeout=10.0,
+        process_start_timeout=5.0,
+        task_stop_timeout=3.0,
+        process_stop_timeout=2.0,
+        process_kill_timeout=2.0,
+        require_media_packet=False,
+        first_packet_timeout=5.0,
     ):
         self.no_data_timeout = no_data_timeout
         self.currentAction = "Idle"
@@ -72,6 +111,39 @@ class Streamer:
         self.resolutions = resolutions
         self.audio = audio
         self.ignore_limit = ignore_limit
+        self.process_start_timeout = process_start_timeout
+        self.task_stop_timeout = task_stop_timeout
+        self.process_stop_timeout = process_stop_timeout
+        self.process_kill_timeout = process_kill_timeout
+        self.require_media_packet = require_media_packet
+        self.first_packet_timeout = first_packet_timeout
+        self._first_packet = asyncio.Event()
+        self._session_close_lock = asyncio.Lock()
+        self.streamProcess = None
+        self._ffmpeg_log_task = None
+        self._media_session = None
+        self._lifecycle_lock = asyncio.Lock()
+
+    @property
+    def healthy(self):
+        """Return True only while both producer task and FFmpeg are alive."""
+        return (
+            self.running
+            and self.stream_task is not None
+            and not self.stream_task.done()
+            and self.streamProcess is not None
+            and self.streamProcess.returncode is None
+        )
+
+    def _log_lifecycle(self, phase, **details):
+        if self.logFunction is not None:
+            self.logFunction(
+                {
+                    "currentAction": self.currentAction,
+                    "lifecyclePhase": phase,
+                    **details,
+                }
+            )
 
     @staticmethod
     def _normalize_list(value):
@@ -140,6 +212,79 @@ class Streamer:
         self.audio_rate = audio_rate
 
     async def start(self):
+        """Start once, with a bounded subprocess launch and verified rollback."""
+        async with self._lifecycle_lock:
+            if self.healthy:
+                return self._stream_info()
+
+            if self.stream_task is not None or self.streamProcess is not None:
+                await self._stop_unlocked()
+
+            self._first_packet.clear()
+            self._log_lifecycle("start.begin")
+            try:
+                info = await _await_bounded(
+                    self._start_unlocked(), self.process_start_timeout
+                )
+                # An FFmpeg subprocess is not proof of a connected camera.
+                # Opt-in direct streams must receive actual MPEG-TS bytes first.
+                if self.require_media_packet:
+                    packet_wait = asyncio.create_task(self._first_packet.wait())
+                    process_wait = asyncio.create_task(self.streamProcess.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {packet_wait, self.stream_task, process_wait},
+                            timeout=self.first_packet_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if packet_wait not in done:
+                            if self.stream_task in done:
+                                err = (None if self.stream_task.cancelled()
+                                       else self.stream_task.exception())
+                                raise RuntimeError(
+                                    f"media producer ended before video data: {err!r}"
+                                )
+                            if process_wait in done:
+                                raise RuntimeError(
+                                    "FFmpeg exited before video data "
+                                    f"(returncode={self.streamProcess.returncode})"
+                                )
+                            raise TimeoutError("No MPEG-TS video packet from camera")
+                    finally:
+                        for helper in (packet_wait, process_wait):
+                            if not helper.done():
+                                helper.cancel()
+                        # Event.wait() owns no external resource. Do not await
+                        # the cancelled helpers here: on Python 3.9 that can
+                        # consume the caller's cancellation. The producer,
+                        # socket and FFmpeg cleanup below remain shielded and
+                        # explicitly verified before cancellation propagates.
+                else:
+                    await asyncio.sleep(0)
+                if self.stream_task.done():
+                    error = (None if self.stream_task.cancelled()
+                             else self.stream_task.exception())
+                    raise RuntimeError(
+                        f"media producer exited during startup: {error!r}"
+                    )
+                self._log_lifecycle(
+                    "start.ready",
+                    ffmpeg_pid=self.streamProcess.pid,
+                    read_fd=info["read_fd"],
+                )
+                return info
+            except BaseException:
+                self._log_lifecycle("start.failed")
+                cleanup = asyncio.create_task(self._stop_unlocked())
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # Do not orphan cleanup if the caller is itself cancelled.
+                    await cleanup
+                    raise
+                raise
+
+    async def _start_unlocked(self):
         self.currentAction = "FFMpeg Starting"
 
         if self.mode == "hls":
@@ -243,14 +388,19 @@ class Streamer:
             limit=2**20,  # 1 MiB
         )
 
-        asyncio.create_task(self._print_ffmpeg_logs(self.streamProcess.stderr))
+        self._ffmpeg_log_task = asyncio.create_task(
+            self._print_ffmpeg_logs(self.streamProcess.stderr)
+        )
 
         self.running = True
         if self.stream_task is None or self.stream_task.done():
             self.stream_task = asyncio.create_task(self._stream_to_ffmpeg())
 
+        return self._stream_info()
+
+    def _stream_info(self):
         read_fd = None
-        if self.mode == "pipe":
+        if self.mode == "pipe" and self.streamProcess is not None:
             read_fd = self.streamProcess.stdout._transport.get_extra_info(
                 "pipe"
             ).fileno()
@@ -282,13 +432,62 @@ class Streamer:
                     }
                 )
 
+    async def _close_media_session(self, session):
+        """Close the real media socket, including cancelled __aenter__ attempts.
+
+        pytapo 3.4.30 HttpMediaSession.close() skips a writer opened before
+        _started=True, so close and verify that writer ourselves as fallback.
+        Keep the session reference on any uncertainty (fail closed).
+        """
+        if session is None:
+            return
+        async with self._session_close_lock:
+            if self._media_session is not session:
+                return
+            errors = []
+            try:
+                await asyncio.wait_for(session.close(), timeout=2.0)
+            except Exception as err:
+                errors.append(f"session.close: {err!r}")
+
+            writer = getattr(session, "_writer", None)
+            if writer is not None:
+                try:
+                    if not writer.is_closing():
+                        writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+                except Exception as err:
+                    errors.append(f"socket writer: {err!r}")
+
+            reader_task = getattr(session, "_response_handler_task", None)
+            if reader_task is not None and not reader_task.done():
+                reader_task.cancel()
+                try:
+                    await asyncio.wait_for(reader_task, timeout=1.0)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as err:
+                    errors.append(f"response handler: {err!r}")
+
+            if (getattr(session, "started", False)
+                    or (writer is not None and not writer.is_closing())
+                    or (reader_task is not None and not reader_task.done())):
+                errors.append("media session not confirmed closed")
+            if errors:
+                raise StreamerCleanupError("; ".join(errors))
+            self._media_session = None
+            self._log_lifecycle("producer.socket_closed")
+
     async def _stream_to_ffmpeg(self):
+        mediaSession = None
         try:
             mediaSession = self.tapo.getMediaSession(StreamType.Stream)
+            self._media_session = mediaSession
             mediaSession.set_window_size(self.window_size)
             self.currentAction = "Streaming"
 
             async with mediaSession:
+                self._log_lifecycle("producer.media_session_connected")
                 payload = json.dumps(self._build_preview_payload())
 
                 async for resp in mediaSession.transceive(
@@ -335,6 +534,10 @@ class Streamer:
                         packet = self._ts_buffer[:188]
                         self._ts_buffer = self._ts_buffer[188:]
                         self.streamProcess.stdin.write(packet)
+                        # Signals transport bytes, not a decoded video frame.
+                        if not self._first_packet.is_set():
+                            self._first_packet.set()
+                            self._log_lifecycle("producer.first_mpegts_packet")
 
                     if not self.includeAudio:
                         try:
@@ -359,25 +562,145 @@ class Streamer:
                 )
         finally:
             self.running = False
-            self.streamProcess.stdin.close()
+            try:
+                if mediaSession is not None:
+                    cleanup = asyncio.create_task(
+                        self._close_media_session(mediaSession)
+                    )
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        # Wait for actual socket cleanup even under cancellation.
+                        await cleanup
+                        raise
+            finally:
+                if (
+                    self.streamProcess is not None
+                    and self.streamProcess.stdin is not None
+                    and not self.streamProcess.stdin.is_closing()
+                ):
+                    self.streamProcess.stdin.close()
 
     async def stop(self):
+        """Stop with bounded waits; never hide a still-running producer."""
+        async with self._lifecycle_lock:
+            cleanup = asyncio.create_task(self._stop_unlocked())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+                raise
+
+    async def _stop_unlocked(self):
         self.currentAction = "Stopping stream"
         self.running = False
-        try:
-            if self.stream_task:
-                self.stream_task.cancel()
-                try:
-                    await self.stream_task
-                except asyncio.CancelledError:
-                    pass
 
-        finally:
-            if self.streamProcess:
+        self._log_lifecycle("stop.begin")
+        cleanup_errors = []
+        task = self.stream_task
+        process = self.streamProcess
+
+        if task is not None and not task.done():
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=self.task_stop_timeout)
+            if not done and self._media_session is not None:
+                # Closing the media session is the operation that releases TCP/8800.
                 try:
-                    self.streamProcess.terminate()
-                    await self.streamProcess.wait()
+                    await asyncio.wait_for(
+                        self._media_session.close(), timeout=self.task_stop_timeout
+                    )
+                except Exception as err:
+                    cleanup_errors.append(f"media session close failed: {err!r}")
+                done, _ = await asyncio.wait(
+                    {task}, timeout=self.task_stop_timeout
+                )
+            if not done:
+                cleanup_errors.append("media producer task is still running")
+        # Even an already-finished producer may have left an open socket.
+        if self._media_session is not None:
+            try:
+                await self._close_media_session(self._media_session)
+            except Exception as err:
+                cleanup_errors.append(f"media connection not closed: {err!r}")
+
+        if task is not None and task.done() and not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self._log_lifecycle(
+                    "stop.producer_error", error=repr(error)
+                )
+
+        if process is not None:
+            if process.stdin is not None and not process.stdin.is_closing():
+                process.stdin.close()
+            if process.returncode is None:
+                try:
+                    process.terminate()
                 except ProcessLookupError:
                     pass
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=self.process_stop_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self._log_lifecycle("stop.kill", ffmpeg_pid=process.pid)
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(), timeout=self.process_kill_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        cleanup_errors.append(
+                            f"FFmpeg pid {process.pid} did not exit after kill"
+                        )
+                except OSError as err:
+                    cleanup_errors.append(f"FFmpeg terminate failed: {err!r}")
+
+        log_task = self._ffmpeg_log_task
+        if log_task is not None and not log_task.done():
+            log_task.cancel()
+            done, _ = await asyncio.wait({log_task}, timeout=1.0)
+            if not done:
+                cleanup_errors.append("FFmpeg log task is still running")
+
+        for fd_name in ("audio_r", "audio_w"):
+            fd = getattr(self, fd_name)
+            if fd is not None:
+                try:
+                    os.close(fd)
                 except OSError:
                     pass
+                setattr(self, fd_name, None)
+
+        task_stopped = task is None or task.done()
+        process_stopped = process is None or process.returncode is not None
+        # Only a successful, verified close clears _media_session. Do not infer
+        # socket closure from a cancelled producer or started=False alone.
+        session_stopped = self._media_session is None
+
+        if not (task_stopped and process_stopped and session_stopped):
+            cleanup_errors.append(
+                "cleanup verification failed "
+                f"(task_stopped={task_stopped}, "
+                f"process_stopped={process_stopped}, "
+                f"session_stopped={session_stopped})"
+            )
+
+        if cleanup_errors:
+            self._log_lifecycle("stop.failed", errors=cleanup_errors)
+            raise StreamerCleanupError("; ".join(cleanup_errors))
+
+        self.stream_task = None
+        self.streamProcess = None
+        if process is not None:
+            for pipe in (process.stdout, process.stderr):
+                transport = getattr(pipe, "_transport", None)
+                if transport is not None:
+                    transport.close()
+        self._ffmpeg_log_task = None
+        self._ts_buffer.clear()
+        self._audio_buffer.clear()
+        self._log_lifecycle("stop.complete")
