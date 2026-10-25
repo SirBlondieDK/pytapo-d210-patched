@@ -1,4 +1,13 @@
-# D210 lifecycle safety patch
+# D210 lifecycle and HA stream-handoff patch
+
+Version: `3.4.30.post2`
+
+The second patch revision adds an opt-in `direct_fd_handoff` output path for
+Home Assistant. It avoids the competing asyncio `StreamReader`, waits for
+FFmpeg output rather than camera input bytes, resends MPEG-TS headers, and
+closes the handoff pipe during every cleanup path. The behavior is disabled by
+default, so ordinary pytapo snapshot, MJPEG, HLS, and two-way-audio paths keep
+their original stdout handling.
 
 This repository is a narrowly scoped derivative of
 [`JurajNyiri/pytapo`](https://github.com/JurajNyiri/pytapo), based on the

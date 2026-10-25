@@ -80,6 +80,7 @@ class Streamer:
         process_kill_timeout=2.0,
         require_media_packet=False,
         first_packet_timeout=5.0,
+        direct_fd_handoff=False,
     ):
         self.no_data_timeout = no_data_timeout
         self.currentAction = "Idle"
@@ -117,11 +118,18 @@ class Streamer:
         self.process_kill_timeout = process_kill_timeout
         self.require_media_packet = require_media_packet
         self.first_packet_timeout = first_packet_timeout
+        self.direct_fd_handoff = direct_fd_handoff
+        # Kept under the old name for API compatibility.  The event now means
+        # FFmpeg has produced video output, not merely that encrypted camera
+        # transport bytes reached FFmpeg's stdin.
         self._first_packet = asyncio.Event()
+        self._first_input_packet = asyncio.Event()
         self._session_close_lock = asyncio.Lock()
         self.streamProcess = None
         self._ffmpeg_log_task = None
         self._media_session = None
+        self._output_r = None
+        self._output_w = None
         self._lifecycle_lock = asyncio.Lock()
 
     @property
@@ -221,13 +229,15 @@ class Streamer:
                 await self._stop_unlocked()
 
             self._first_packet.clear()
+            self._first_input_packet.clear()
             self._log_lifecycle("start.begin")
             try:
                 info = await _await_bounded(
                     self._start_unlocked(), self.process_start_timeout
                 )
-                # An FFmpeg subprocess is not proof of a connected camera.
-                # Opt-in direct streams must receive actual MPEG-TS bytes first.
+                # Neither an FFmpeg subprocess nor bytes written to its stdin
+                # prove that HA can consume video.  Wait for FFmpeg progress,
+                # which confirms that the demux/mux path produced video output.
                 if self.require_media_packet:
                     packet_wait = asyncio.create_task(self._first_packet.wait())
                     process_wait = asyncio.create_task(self.streamProcess.wait())
@@ -249,7 +259,7 @@ class Streamer:
                                     "FFmpeg exited before video data "
                                     f"(returncode={self.streamProcess.returncode})"
                                 )
-                            raise TimeoutError("No MPEG-TS video packet from camera")
+                            raise TimeoutError("FFmpeg produced no video output")
                     finally:
                         for helper in (packet_wait, process_wait):
                             if not helper.done():
@@ -300,6 +310,14 @@ class Streamer:
             "ffmpeg",
             "-loglevel",
             self.ff_args.get("-loglevel", f"{self.logLevel}"),
+        ]
+        if self.direct_fd_handoff:
+            cmd += [
+                "-nostats",
+                "-progress",
+                "pipe:2",
+            ]
+        cmd += [
             "-probesize",
             self.ff_args.get("-probesize", f"{self.probeSize}"),
             "-analyzeduration",
@@ -370,23 +388,51 @@ class Streamer:
                 os.path.join(self.outputDirectory, self.fileName),
             ]
         else:
+            output_format = self.ff_args.get("-f", "mpegts")
             cmd += [
                 "-f",
-                self.ff_args.get("-f", "mpegts"),
-                "pipe:1",
+                output_format,
             ]
+            if output_format == "mpegts" and self.direct_fd_handoff:
+                cmd += [
+                    "-mpegts_flags",
+                    "+resend_headers",
+                    "-muxdelay",
+                    "0",
+                ]
+            cmd += ["pipe:1"]
 
-        self.streamProcess = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            pass_fds=pass_fds,
-            # ffmpeg can emit very long stderr lines (a single warning/error with
-            # no newline). The default StreamReader limit is 64 KiB, which makes
-            # readline() raise ValueError on such a line; give it more headroom.
-            limit=2**20,  # 1 MiB
-        )
+        stdout_target = subprocess.PIPE
+        if self.mode == "pipe" and self.direct_fd_handoff:
+            # Do not use asyncio's stdout=PIPE for HA direct streams.  Its
+            # StreamReader transport eagerly drains the kernel pipe into a
+            # private Python buffer, racing PyAV which opens pipe:<read_fd> in a
+            # worker thread.  Give FFmpeg a dedicated OS pipe instead so there
+            # is exactly one reader: Home Assistant's stream worker.
+            self._output_r, self._output_w = os.pipe()
+            stdout_target = self._output_w
+
+        try:
+            self.streamProcess = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=subprocess.PIPE,
+                stdout=stdout_target,
+                stderr=subprocess.PIPE,
+                pass_fds=pass_fds,
+                # ffmpeg can emit very long stderr lines (a single warning/error with
+                # no newline). The default StreamReader limit is 64 KiB, which makes
+                # readline() raise ValueError on such a line; give it more headroom.
+                limit=2**20,  # 1 MiB
+            )
+        except BaseException:
+            self._close_output_pipe()
+            raise
+        finally:
+            # create_subprocess_exec duplicated the write end for the child.
+            # Keeping the parent copy open would prevent EOF reaching PyAV.
+            if self._output_w is not None:
+                os.close(self._output_w)
+                self._output_w = None
 
         self._ffmpeg_log_task = asyncio.create_task(
             self._print_ffmpeg_logs(self.streamProcess.stderr)
@@ -401,9 +447,12 @@ class Streamer:
     def _stream_info(self):
         read_fd = None
         if self.mode == "pipe" and self.streamProcess is not None:
-            read_fd = self.streamProcess.stdout._transport.get_extra_info(
-                "pipe"
-            ).fileno()
+            if self.direct_fd_handoff:
+                read_fd = self._output_r
+            elif self.streamProcess.stdout is not None:
+                read_fd = self.streamProcess.stdout._transport.get_extra_info(
+                    "pipe"
+                ).fileno()
 
         return {
             "ffmpegProcess": self.streamProcess,
@@ -424,13 +473,34 @@ class Streamer:
                 continue
             if not line:
                 break
+            decoded = line.decode(errors="replace").strip()
+            if decoded.startswith("frame="):
+                try:
+                    frame_count = int(decoded.split("=", 1)[1].strip())
+                except ValueError:
+                    frame_count = 0
+                if frame_count > 0 and not self._first_packet.is_set():
+                    self._first_packet.set()
+                    self._log_lifecycle("producer.first_ffmpeg_output")
             if self.logFunction is not None:
                 self.logFunction(
                     {
                         "currentAction": self.currentAction,
-                        "ffmpegLog": line.decode().strip(),
+                        "ffmpegLog": decoded,
                     }
                 )
+
+    def _close_output_pipe(self):
+        """Close both parent-side output descriptors idempotently."""
+        for name in ("_output_r", "_output_w"):
+            fd = getattr(self, name)
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            setattr(self, name, None)
 
     async def _close_media_session(self, session):
         """Close the real media socket, including cancelled __aenter__ attempts.
@@ -534,9 +604,8 @@ class Streamer:
                         packet = self._ts_buffer[:188]
                         self._ts_buffer = self._ts_buffer[188:]
                         self.streamProcess.stdin.write(packet)
-                        # Signals transport bytes, not a decoded video frame.
-                        if not self._first_packet.is_set():
-                            self._first_packet.set()
+                        if not self._first_input_packet.is_set():
+                            self._first_input_packet.set()
                             self._log_lifecycle("producer.first_mpegts_packet")
 
                     if not self.includeAudio:
@@ -633,6 +702,9 @@ class Streamer:
         if process is not None:
             if process.stdin is not None and not process.stdin.is_closing():
                 process.stdin.close()
+            # Closing the read end makes FFmpeg observe a broken consumer and
+            # also unblocks HA/PyAV before we wait for the worker to stop.
+            self._close_output_pipe()
             if process.returncode is None:
                 try:
                     process.terminate()
@@ -701,6 +773,7 @@ class Streamer:
                 if transport is not None:
                     transport.close()
         self._ffmpeg_log_task = None
+        self._close_output_pipe()
         self._ts_buffer.clear()
         self._audio_buffer.clear()
         self._log_lifecycle("stop.complete")
